@@ -1,0 +1,41 @@
+name: Hourly Feature Pipeline
+
+on:
+  schedule:
+    - cron: "5 * * * *" # 5 minutes past every hour, UTC
+  workflow_dispatch: {} # allows manual trigger from the Actions tab
+
+jobs:
+  run-feature-pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run feature pipeline
+        env:
+          OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
+          HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
+          HOPSWORKS_PROJECT_NAME: ${{ secrets.HOPSWORKS_PROJECT_NAME }}
+        run: python pipelines/02_feature_pipeline.py
+
+      - name: Run batch inference
+        env:
+          OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
+          HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
+          HOPSWORKS_PROJECT_NAME: ${{ secrets.HOPSWORKS_PROJECT_NAME }}
+        run: python pipelines/04_batch_inference.py
+
+      - name: Commit updated local data (fallback mode only)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/feature_store_local.parquet data/latest_predictions.json || true
+          git diff --staged --quiet || git commit -m "Automated hourly feature update [skip ci]"
+          git push || true

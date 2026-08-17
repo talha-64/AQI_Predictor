@@ -1,0 +1,33 @@
+name: Daily Training Pipeline
+
+on:
+  schedule:
+    - cron: "30 2 * * *" # 02:30 UTC daily — after several hourly feature runs have landed
+  workflow_dispatch: {}
+
+jobs:
+  run-training-pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run training pipeline
+        env:
+          HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
+          HOPSWORKS_PROJECT_NAME: ${{ secrets.HOPSWORKS_PROJECT_NAME }}
+        run: python pipelines/03_training_pipeline.py
+
+      - name: Commit updated local models (fallback mode only)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add models/ || true
+          git diff --staged --quiet || git commit -m "Automated daily model retrain [skip ci]"
+          git push || true
