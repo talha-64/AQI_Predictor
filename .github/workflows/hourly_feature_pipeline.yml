@@ -31,11 +31,3 @@ jobs:
           HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
           HOPSWORKS_PROJECT_NAME: ${{ secrets.HOPSWORKS_PROJECT_NAME }}
         run: python pipelines/04_batch_inference.py
-
-      - name: Commit updated local data (fallback mode only)
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/feature_store_local.parquet data/latest_predictions.json || true
-          git diff --staged --quiet || git commit -m "Automated hourly feature update [skip ci]"
-          git push || true

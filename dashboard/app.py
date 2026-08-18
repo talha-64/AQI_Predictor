@@ -3,7 +3,6 @@ Streamlit dashboard for the AQI Predictor.
 Run with: streamlit run dashboard/app.py
 """
 import os
-import json
 import sys
 from pathlib import Path
 
@@ -12,6 +11,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import pandas as pd
 import streamlit as st
+import hopsworks
 
 from src import config, model_trainer
 from src.utils import get_logger, read_features
@@ -32,10 +32,46 @@ CATEGORY_COLORS = {
 
 @st.cache_data(ttl=300)
 def load_predictions():
-    if not Path(config.PREDICTIONS_PATH).exists():
+    try:
+        project = hopsworks.login(
+            project=config.HOPSWORKS_PROJECT_NAME,
+            api_key_value=config.HOPSWORKS_API_KEY,
+        )
+        fs = project.get_feature_store()
+        pred_fg = fs.get_feature_group("aqi_predictions_fg", version=1)
+        df_preds = pred_fg.read()
+        
+        if df_preds.empty:
+            return None
+            
+        # Get the latest prediction row by event timestamp
+        latest_row = df_preds.sort_values("created_at_unix").iloc[-1]
+        
+        return {
+            "generated_at": str(latest_row["generated_at"]),
+            "current_aqi": float(latest_row["current_aqi"]),
+            "current_category": str(latest_row["current_category"]),
+            "forecast": {
+                "day_1": {
+                    "aqi": float(latest_row["day1_aqi"]),
+                    "category": str(latest_row["day1_category"]),
+                    "hazardous_alert": bool(latest_row["day1_hazardous"]),
+                },
+                "day_2": {
+                    "aqi": float(latest_row["day2_aqi"]),
+                    "category": str(latest_row["day2_category"]),
+                    "hazardous_alert": bool(latest_row["day2_hazardous"]),
+                },
+                "day_3": {
+                    "aqi": float(latest_row["day3_aqi"]),
+                    "category": str(latest_row["day3_category"]),
+                    "hazardous_alert": bool(latest_row["day3_hazardous"]),
+                },
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error reading predictions from Hopsworks: {e}")
         return None
-    with open(config.PREDICTIONS_PATH) as f:
-        return json.load(f)
 
 
 @st.cache_data(ttl=3600)
@@ -71,7 +107,7 @@ def main():
 
     predictions = load_predictions()
     if predictions is None:
-        st.warning("No predictions available yet. Run `pipelines/04_batch_inference.py` first.")
+        st.warning("No predictions available in Hopsworks yet. Run `pipelines/04_batch_inference.py` first.")
         return
 
     st.caption(f"Last updated: {predictions['generated_at']} UTC")
