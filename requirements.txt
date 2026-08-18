@@ -1,5 +1,6 @@
 # Feature Store & Cloud
 hopsworks==5.0.4
+confluent-kafka
 
 # Data Processing & ML
 pandas
