@@ -134,32 +134,32 @@ def main():
     st.divider()
 
     st.subheader("What's driving the Day 1 forecast? (SHAP)")
-    render_shap_section()
+    # render_shap_section()
 
 
-def render_shap_section():
-    try:
-        import shap
+# def render_shap_section():
+#     try:
+#         import shap
 
-        models, feature_cols, feats_per_horizon = load_models_and_features()
-        history = read_features().sort_values("datetime_utc")
-        sample = history[feats_per_horizon[1]].dropna().tail(500)
+#         models, feature_cols, feats_per_horizon = load_models_and_features()
+#         history = read_features().sort_values("datetime_utc")
+#         sample = history[feats_per_horizon[1]].dropna().tail(500)
 
-        if len(sample) < 20:
-            st.info("Not enough history yet for a SHAP explanation.")
-            return
+#         if len(sample) < 20:
+#             st.info("Not enough history yet for a SHAP explanation.")
+#             return
 
-        explainer = shap.TreeExplainer(models["model_day1"])
-        shap_values = explainer.shap_values(sample)
+#         explainer = shap.TreeExplainer(models["model_day1"])
+#         shap_values = explainer.shap_values(sample)
 
-        importance = pd.Series(
-            abs(shap_values).mean(axis=0), index=feats_per_horizon[1]
-        ).sort_values(ascending=False).head(10)
+#         importance = pd.Series(
+#             abs(shap_values).mean(axis=0), index=feats_per_horizon[1]
+#         ).sort_values(ascending=False).head(10)
 
-        st.bar_chart(importance)
-        st.caption("Mean absolute SHAP value — top 10 features driving the Day 1 forecast")
-    except Exception as e:
-        st.info(f"SHAP explanation unavailable: {e}")
+#         st.bar_chart(importance)
+#         st.caption("Mean absolute SHAP value — top 10 features driving the Day 1 forecast")
+#     except Exception as e:
+#         st.info(f"SHAP explanation unavailable: {e}")
 
 
 if __name__ == "__main__":
