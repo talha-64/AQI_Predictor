@@ -7,6 +7,9 @@ import sys
 import logging
 from pathlib import Path
 
+# Force-disable unstable Arrow Flight gRPC before Hopsworks imports
+os.environ["HOPSWORKS_NO_ARROW_FLIGHT"] = "true"
+
 # Add project root to sys.path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -31,7 +34,7 @@ CATEGORY_COLORS = {
 }
 
 
-@st.cache_resource
+@st.cache_resource(ttl=3600)
 def get_hopsworks_project():
     return hopsworks.login(
         project=config.HOPSWORKS_PROJECT_NAME,
@@ -39,30 +42,34 @@ def get_hopsworks_project():
     )
 
 
-def read_feature_group_robust(fg):
-    """
-    Same fallback pattern used in pipelines/04_batch_inference.py: try the
-    online store first (goes through Hopsworks' REST API, not the offline
-    Arrow Flight/DuckDB service), then fall back to the Hive/Spark backend.
-    Deliberately avoids the plain fg.read() default and any
-    "use_duckdb"/arrow-flight-disable options -- those route through the
-    offline Arrow Flight/DuckDB query service, which has a known
-    server-side crash ("release unlocked lock") as of Aug 2026.
+def read_feature_group_fast(fg):
+    """Fast offline feature reader using DuckDB over REST.
+    
+    Avoids Hive/Spark fallbacks which cause multi-minute hangs in cloud apps.
     """
     try:
+        # 1. Primary: Try direct online store query (sub-second)
         return fg.read(online=True)
     except Exception as e:
-        logger.warning(f"Online read failed ({e}). Falling back to Hive/Spark backend...")
-        return fg.read(read_options={"use_hive": True})
+        logger.warning(f"Online read failed ({e}). Falling back to DuckDB REST engine...")
+        # 2. Fallback: Fast DuckDB engine over HTTP REST instead of slow Hive/Spark
+        return fg.select_all().read(
+            dataframe_type="pandas",
+            read_options={
+                "use_duckdb": True,
+                "arrow_flight_config": {"disable_flight": True},
+            },
+        )
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=300, show_spinner="Loading latest predictions...")
 def load_predictions():
     try:
         project = get_hopsworks_project()
         fs = project.get_feature_store()
         pred_fg = fs.get_feature_group("aqi_predictions_fg", version=1)
-        df_preds = read_feature_group_robust(pred_fg)
+        
+        df_preds = read_feature_group_fast(pred_fg)
 
         if df_preds is None or df_preds.empty:
             return None, None
@@ -94,34 +101,30 @@ def load_predictions():
         return result, None
     except Exception as e:
         logger.error(f"Error reading predictions from Hopsworks: {e}")
-        # Was: silently returned None with no visible reason. Now the actual
-        # exception comes back so the UI can show it instead of a generic
-        # "no predictions" message that looks the same whether the feature
-        # group is genuinely empty or Hopsworks itself is failing.
         return None, str(e)
 
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=1800, show_spinner="Loading historical trend...")
 def load_recent_history(hours: int = 24 * 14):
-    project = get_hopsworks_project()
-    fs = project.get_feature_store()
-    fg = fs.get_feature_group(config.FEATURE_GROUP_NAME, version=config.FEATURE_GROUP_VERSION)
-    df = read_feature_group_robust(fg)
-    df = df.sort_values("datetime_utc")
-    return df.tail(hours)[["datetime_utc", "epa_aqi"]]
+    try:
+        project = get_hopsworks_project()
+        fs = project.get_feature_store()
+        fg = fs.get_feature_group(config.FEATURE_GROUP_NAME, version=config.FEATURE_GROUP_VERSION)
+        
+        # Read with DuckDB over REST
+        df = read_feature_group_fast(fg)
+        
+        if "datetime_utc" in df.columns:
+            df["datetime_utc"] = pd.to_datetime(df["datetime_utc"])
+            df = df.sort_values("datetime_utc")
+            return df.tail(hours)[["datetime_utc", "epa_aqi"]]
+        return pd.DataFrame()
+    except Exception as e:
+        logger.error(f"Error fetching history: {e}")
+        return pd.DataFrame()
 
 
-@st.cache_resource
-def load_models_and_features():
-    # Was: model_trainer.load_models() -- that function doesn't exist.
-    # The real function (see src/model_trainer.py) is load_models_local(),
-    # which reads from the local models/ directory written by
-    # 03_training_pipeline.py's save_models_local(). Only used by the
-    # (currently disabled) SHAP section below.
-    return model_trainer.load_models_local(in_dir=os.path.join(os.path.dirname(__file__), "..", "models"))
-
-
-def render_forecast_card(col, label, day_data, is_current=False):
+def render_forecast_card(col, label, day_data):
     color = CATEGORY_COLORS.get(day_data["category"], "#888888")
     with col:
         st.markdown(f"**{label}**")
@@ -145,9 +148,6 @@ def main():
     if predictions is None:
         if error:
             st.error(f"Could not read predictions from Hopsworks: {error}")
-            st.caption("If this mentions 'release unlocked lock' or an Arrow Flight error, this is a known "
-                       "server-side issue with Hopsworks' offline query service -- rerun in a few minutes, "
-                       "or check that pipelines/04_batch_inference.py's fallback logic is actually being hit.")
         else:
             st.warning("No predictions available in Hopsworks yet. Run `pipelines/04_batch_inference.py` first.")
         return
@@ -167,41 +167,11 @@ def main():
     st.divider()
 
     st.subheader("Recent AQI trend (last 14 days)")
-    try:
-        history = load_recent_history()
+    history = load_recent_history()
+    if not history.empty:
         st.line_chart(history.set_index("datetime_utc")["epa_aqi"])
-    except Exception as e:
-        st.info(f"History unavailable: {e}")
-
-    st.divider()
-
-    st.subheader("What's driving the Day 1 forecast? (SHAP)")
-    # render_shap_section()
-
-
-# def render_shap_section():
-#     try:
-#         import shap
-#
-#         models, feature_cols, feats_per_horizon = load_models_and_features()
-#         history = load_recent_history(hours=24 * 30)
-#         sample = history[feats_per_horizon[1]].dropna().tail(500)
-#
-#         if len(sample) < 20:
-#             st.info("Not enough history yet for a SHAP explanation.")
-#             return
-#
-#         explainer = shap.TreeExplainer(models["model_day1"])
-#         shap_values = explainer.shap_values(sample)
-#
-#         importance = pd.Series(
-#             abs(shap_values).mean(axis=0), index=feats_per_horizon[1]
-#         ).sort_values(ascending=False).head(10)
-#
-#         st.bar_chart(importance)
-#         st.caption("Mean absolute SHAP value -- top 10 features driving the Day 1 forecast")
-#     except Exception as e:
-#         st.info(f"SHAP explanation unavailable: {e}")
+    else:
+        st.info("History currently unavailable.")
 
 
 if __name__ == "__main__":
