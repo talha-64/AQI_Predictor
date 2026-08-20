@@ -1,5 +1,6 @@
 import sys
 import os
+import json
 import tempfile
 import joblib
 import logging
@@ -51,8 +52,6 @@ AQI_CATEGORIES = [
     ("Hazardous", 301, 500),
 ]
 HAZARD_ALERT_THRESHOLD = 200
-
-# History depth needed for the longest engineered window (168h EMA/lag), with margin.
 HISTORY_HOURS_NEEDED = 250
 
 
@@ -64,22 +63,6 @@ def aqi_category(value: float) -> str:
 
 
 def fetch_latest_features(fg) -> pd.DataFrame:
-    """
-    Reads recent feature rows from the Feature Group. Tries the ONLINE store
-    first (goes through Hopsworks' REST API to RonDB, not the offline Arrow
-    Flight/DuckDB service) -- this is the path that actually succeeded in
-    testing, just somewhat slow (~2-3 min). Falls back to the Hive/Spark
-    backend, which is a genuinely different code path from Arrow Flight
-    (per Hopsworks docs: read_options={"use_hive": True}), not another
-    route through the same service.
-
-    Deliberately does NOT attempt fg.read() (default) or any
-    "use_duckdb"/arrow-flight-disable combination -- those all route through
-    the offline Arrow Flight/DuckDB query service, which has a known
-    server-side crash ("release unlocked lock") as of Aug 2026. If that
-    service gets fixed on Hopsworks' end later, the Hive fallback below can
-    be replaced with the plain offline fg.read() for speed.
-    """
     try:
         logger.info("Attempting online feature group read...")
         df_features = fg.read(online=True)
@@ -100,10 +83,6 @@ def fetch_latest_features(fg) -> pd.DataFrame:
 
 
 def load_models_from_registry(mr):
-    """Downloads and loads all 3 horizon models from the Hopsworks Model
-    Registry. Falls back to the local models/ dir (written by
-    03_training_pipeline.py's save_models_local) if the registry download
-    fails or a model.pkl can't be loaded from the downloaded directory."""
     models = {}
     try:
         for idx in HORIZONS:
@@ -136,16 +115,12 @@ def main():
     feature_store = project.get_feature_store()
     mr = project.get_model_registry()
 
-    # 1. Load all 3 horizon models
     models = load_models_from_registry(mr)
 
-    # 2. Fetch recent features from Hopsworks (need history for EMA/lag context,
-    #    not just the single latest row)
     logger.info(f"Fetching recent feature records from '{FEATURE_GROUP_NAME}_v{FEATURE_GROUP_VERSION}'...")
     fg = feature_store.get_feature_group(name=FEATURE_GROUP_NAME, version=FEATURE_GROUP_VERSION)
     df_features = fetch_latest_features(fg)
 
-    # Forward-fill short feature gaps only -- never fabricate epa_aqi or any target
     fill_cols = [c for c in df_features.columns if c not in NON_FEATURE_COLS]
     df_features[fill_cols] = df_features[fill_cols].ffill()
 
@@ -154,11 +129,6 @@ def main():
     current_aqi = float(latest_row["epa_aqi"].iloc[0])
     logger.info(f"Latest observation timestamp: {latest_ts} | Current EPA AQI: {current_aqi}")
 
-    # 3. Reconstruct the exact same pruned feature list used at training time.
-    #    get_final_feature_list is a pure function of the column list, so as
-    #    long as feature_engineering.py hasn't changed since training, this
-    #    reproduces the training-time feature set without needing to ship
-    #    feature-list metadata alongside the model artifacts.
     all_feature_cols = [
         c for c in df_features.columns
         if c not in NON_FEATURE_COLS and str(df_features[c].dtype) in ["float64", "int64", "int32", "float32"]
@@ -167,7 +137,6 @@ def main():
     feats_per_horizon = feats_used_per_horizon(final_features)
     logger.info(f"Using {len(final_features)} features for inference.")
 
-    # 4. Chained + persistence-blended 3-day forecast
     logger.info("Running batch inference across horizons...")
     predictions = predict_next_3_days(models, latest_row, feats_per_horizon)
 
@@ -188,12 +157,9 @@ def main():
         "day3_category": aqi_category(predictions[3]),
         "day3_hazardous": bool(predictions[3] >= HAZARD_ALERT_THRESHOLD),
     }
-    pred_df = pd.DataFrame([pred_data])
 
-    # 5. Insert predictions into Hopsworks Feature Group
-    # time_travel_format="HUDI" is required here -- without it, this client
-    # defaults to DELTA, which fails on environments without the delta
-    # library installed (no Spark).
+    # 5A. Insert predictions into Hopsworks Feature Group
+    pred_df = pd.DataFrame([pred_data])
     logger.info(f"Writing prediction record to Hopsworks feature group '{PREDICTIONS_FG_NAME}'...")
     pred_fg = feature_store.get_or_create_feature_group(
         name=PREDICTIONS_FG_NAME,
@@ -204,6 +170,39 @@ def main():
         time_travel_format="HUDI",
     )
     pred_fg.insert(pred_df, write_options={"wait_for_job": False})
+
+    # 5B. Export prediction snapshot to local JSON file
+    json_payload = {
+        "generated_at": pred_data["generated_at"],
+        "current_aqi": pred_data["current_aqi"],
+        "current_category": pred_data["current_category"],
+        "forecast": {
+            "day_1": {
+                "aqi": pred_data["day1_aqi"],
+                "category": pred_data["day1_category"],
+                "hazardous_alert": pred_data["day1_hazardous"],
+            },
+            "day_2": {
+                "aqi": pred_data["day2_aqi"],
+                "category": pred_data["day2_category"],
+                "hazardous_alert": pred_data["day2_hazardous"],
+            },
+            "day_3": {
+                "aqi": pred_data["day3_aqi"],
+                "category": pred_data["day3_category"],
+                "hazardous_alert": pred_data["day3_hazardous"],
+            },
+        },
+    }
+
+    output_dir = ROOT_DIR / "data"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    json_path = output_dir / "latest_predictions.json"
+
+    with open(json_path, "w") as f:
+        json.dump(json_payload, f, indent=2)
+
+    logger.info(f"Successfully exported prediction snapshot to '{json_path}'.")
 
     logger.info("\n" + "=" * 50)
     logger.info("           3-DAY AIR QUALITY FORECAST              ")

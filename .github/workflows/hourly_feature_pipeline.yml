@@ -1,4 +1,4 @@
-name: Hourly Feature Pipeline
+name: Hourly Feature & Inference Pipeline
 
 on:
   schedule:
@@ -6,8 +6,11 @@ on:
   workflow_dispatch: {} # allows manual trigger from the Actions tab
 
 jobs:
-  run-feature-pipeline:
+  run-pipeline:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # Grants write permissions to commit updated predictions JSON
+
     steps:
       - uses: actions/checkout@v4
 
@@ -31,3 +34,10 @@ jobs:
           HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
           HOPSWORKS_PROJECT_NAME: ${{ secrets.HOPSWORKS_PROJECT_NAME }}
         run: python pipelines/04_batch_inference.py
+
+      - name: Commit & Push Latest Predictions JSON
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/latest_predictions.json
+          git diff-index --quiet HEAD || (git commit -m "chore: auto-update latest_predictions.json [skip ci]" && git push)
