@@ -171,7 +171,6 @@ def main():
     )
     pred_fg.insert(pred_df, write_options={"wait_for_job": False})
 
-    # 5B. Export prediction snapshot to local JSON file
     json_payload = {
         "generated_at": pred_data["generated_at"],
         "current_aqi": pred_data["current_aqi"],
@@ -195,14 +194,14 @@ def main():
         },
     }
 
-    output_dir = ROOT_DIR / "data"
+    output_dir = ROOT_DIR / "predictions"
     output_dir.mkdir(parents=True, exist_ok=True)
     json_path = output_dir / "latest_predictions.json"
 
     with open(json_path, "w") as f:
         json.dump(json_payload, f, indent=2)
 
-    logger.info(f"Successfully exported prediction snapshot to '{json_path}'.")
+    logger.info(f"Successfully saved snapshot to {json_path}")
 
     logger.info("\n" + "=" * 50)
     logger.info("           3-DAY AIR QUALITY FORECAST              ")
