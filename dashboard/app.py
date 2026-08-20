@@ -6,12 +6,19 @@ import os
 import sys
 import json
 import logging
-import requests
+from pathlib import Path
+
+# Force-disable unstable Arrow Flight gRPC before Hopsworks imports
+os.environ["HOPSWORKS_NO_ARROW_FLIGHT"] = "true"
+
+# Add project root to sys.path
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 import pandas as pd
 import streamlit as st
+import hopsworks
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from src import config
+from src import config, model_trainer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("dashboard")
@@ -28,9 +35,37 @@ CATEGORY_COLORS = {
 }
 
 
-@st.cache_data(ttl=60, show_spinner="Loading predictions...")
+@st.cache_resource(ttl=3600)
+def get_hopsworks_project():
+    return hopsworks.login(
+        project=config.HOPSWORKS_PROJECT_NAME,
+        api_key_value=config.HOPSWORKS_API_KEY,
+    )
+
+
+def read_feature_group_fast(fg):
+    """Fast offline feature reader using DuckDB over REST.
+    
+    Avoids Hive/Spark fallbacks which cause multi-minute hangs in cloud apps.
+    """
+    try:
+        # 1. Primary: Try direct online store query (sub-second)
+        return fg.read(online=True)
+    except Exception as e:
+        logger.warning(f"Online read failed ({e}). Falling back to DuckDB REST engine...")
+        # 2. Fallback: Fast DuckDB engine over HTTP REST instead of slow Hive/Spark
+        return fg.select_all().read(
+            dataframe_type="pandas",
+            read_options={
+                "use_duckdb": True,
+                "arrow_flight_config": {"disable_flight": True},
+            },
+        )
+
+
+@st.cache_data(ttl=60, show_spinner="Loading latest predictions...")
 def load_predictions():
-    json_path = os.path.join(os.path.dirname(__file__), "..", "data", "latest_predictions.json")
+    json_path = os.path.join(os.path.dirname(__file__), "..", "predictions", "latest_predictions.json")
     
     if os.path.exists(json_path):
         try:
@@ -40,23 +75,27 @@ def load_predictions():
         except Exception as e:
             logger.error(f"Error reading local predictions JSON: {e}")
 
-    return None, "File 'data/latest_predictions.json' not found. Ensure batch inference has run."
+    return None, "File 'predictions/latest_predictions.json' not found. Ensure batch inference has run."
 
 
 @st.cache_data(ttl=1800, show_spinner="Loading historical trend...")
-def fetch_recent_history_openmeteo():
+def load_recent_history(hours: int = 24 * 14):
     try:
-        url = "https://air-quality-api.open-meteo.com/v1/air-quality?latitude=31.5497&longitude=74.3436&past_days=14&hourly=us_aqi"
-        res = requests.get(url, timeout=5)
-        if res.status_code == 200:
-            data = res.json()
-            return pd.DataFrame({
-                "datetime_utc": pd.to_datetime(data["hourly"]["time"]),
-                "epa_aqi": data["hourly"]["us_aqi"]
-            })
+        project = get_hopsworks_project()
+        fs = project.get_feature_store()
+        fg = fs.get_feature_group(config.FEATURE_GROUP_NAME, version=config.FEATURE_GROUP_VERSION)
+        
+        # Read with DuckDB over REST
+        df = read_feature_group_fast(fg)
+        
+        if "datetime_utc" in df.columns:
+            df["datetime_utc"] = pd.to_datetime(df["datetime_utc"])
+            df = df.sort_values("datetime_utc")
+            return df.tail(hours)[["datetime_utc", "epa_aqi"]]
+        return pd.DataFrame()
     except Exception as e:
-        logger.error(f"Error fetching history from Open-Meteo: {e}")
-    return pd.DataFrame()
+        logger.error(f"Error fetching history: {e}")
+        return pd.DataFrame()
 
 
 def render_forecast_card(col, label, day_data):
@@ -81,7 +120,10 @@ def main():
 
     predictions, error = load_predictions()
     if predictions is None:
-        st.error(f"Could not load predictions: {error}")
+        if error:
+            st.error(f"Could not load predictions: {error}")
+        else:
+            st.warning("No predictions available yet. Run `pipelines/04_batch_inference.py` first.")
         return
 
     st.caption(f"Last updated: {predictions.get('generated_at', 'N/A')} UTC")
@@ -101,11 +143,11 @@ def main():
     st.divider()
 
     st.subheader("Recent AQI trend (last 14 days)")
-    history = fetch_recent_history_openmeteo()
+    history = load_recent_history()
     if not history.empty:
         st.line_chart(history.set_index("datetime_utc")["epa_aqi"])
     else:
-        st.info("Historical trend unavailable.")
+        st.info("History currently unavailable.")
 
 
 if __name__ == "__main__":
