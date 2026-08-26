@@ -146,6 +146,13 @@ def main():
             latest_feature_row_aligned[col] = latest_feature_row_aligned[col].astype("float64")
 
     logger.info("Inserting engineered live feature vector into Hopsworks...")
+    numeric_cols = latest_feature_row_aligned.select_dtypes(include=["float64", "int64"]).columns
+    numeric_cols = [c for c in numeric_cols if c != "timestamp_unix"]
+    latest_feature_row_aligned[numeric_cols] = latest_feature_row_aligned[numeric_cols].astype("float32")
+
+    if "timestamp_unix" in latest_feature_row_aligned.columns:
+        latest_feature_row_aligned["timestamp_unix"] = latest_feature_row_aligned["timestamp_unix"].astype("int64")
+
     fg.insert(latest_feature_row_aligned, write_options={"wait_for_job": False})
 
     if "epa_aqi" in latest_feature_row.columns:

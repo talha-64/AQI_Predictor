@@ -128,26 +128,24 @@ def update_recent_history_snapshot(fg, latest_row: pd.DataFrame):
     """
     # NOTE: datetime_utc can come back tz-naive or tz-aware depending on which
     # Hopsworks backend served the read (online/RonDB vs. Hive/Spark fallback --
-    # see fetch_recent_features). Since this function may combine rows pulled
-    # from *different* backends in a single run (e.g. online succeeds for the
-    # prediction row but falls back to Hive for the backfill), every
-    # datetime_utc column is forced to the same tz representation (UTC-aware)
-    # immediately after parsing. Do not remove this normalization even if a
-    # single read path seems to "always" return one form -- the fallback in
-    # fetch_recent_features means the backend (and therefore tz-awareness)
-    # can differ read-to-read within the same run.
-    def _to_utc(series):
-        s = pd.to_datetime(series)
-        if s.dt.tz is None:
-            return s.dt.tz_localize("UTC")
-        return s.dt.tz_convert("UTC")
+    # see fetch_recent_features). An earlier version of this normalization
+    # converted everything to tz-AWARE, but pandas can still silently produce
+    # a mixed-dtype (object) column when concatenating two "aware" columns
+    # whose tz representations aren't identical -- which is exactly what
+    # caused a "Cannot compare tz-naive and tz-aware timestamps" crash here
+    # despite that normalization being in place. Converting to tz-naive UTC
+    # instead (via utc=True, then stripping the tz) is strictly safer: two
+    # naive datetime64 columns can never mismatch this way. Do not switch
+    # this back to a "detect and conditionally localize" approach.
+    def _to_naive_utc(series):
+        return pd.to_datetime(series, utc=True).dt.tz_localize(None)
 
     new_row = latest_row[["datetime_utc", "epa_aqi"]].copy()
-    new_row["datetime_utc"] = _to_utc(new_row["datetime_utc"])
+    new_row["datetime_utc"] = _to_naive_utc(new_row["datetime_utc"])
 
     if os.path.exists(RECENT_HISTORY_PATH):
         hist = pd.read_csv(RECENT_HISTORY_PATH)
-        hist["datetime_utc"] = _to_utc(hist["datetime_utc"])
+        hist["datetime_utc"] = _to_naive_utc(hist["datetime_utc"])
         combined = pd.concat([hist, new_row], ignore_index=True)
         # Dedupe in case this hour's row already exists (e.g. pipeline re-run) --
         # keep the newer version.
@@ -159,7 +157,7 @@ def update_recent_history_snapshot(fg, latest_row: pd.DataFrame):
         )
         backfill = fetch_recent_features(fg, read_hours=CHART_HISTORY_HOURS + 10)
         combined = backfill[["datetime_utc", "epa_aqi"]].copy()
-        combined["datetime_utc"] = _to_utc(combined["datetime_utc"])
+        combined["datetime_utc"] = _to_naive_utc(combined["datetime_utc"])
         combined = pd.concat([combined, new_row], ignore_index=True)
         combined = combined.drop_duplicates(subset="datetime_utc", keep="last")
 
@@ -178,13 +176,31 @@ def update_recent_history_snapshot(fg, latest_row: pd.DataFrame):
     )
 
 
+def get_latest_model_version(mr, model_name: str) -> int:
+    """
+    Hopsworks auto-increments the model version each time a new one is
+    registered under the same name (register_model_to_hopsworks in
+    model_trainer.py, called fresh by 03_training_pipeline.py every day).
+    Hardcoding version=1 would mean inference keeps serving the very first
+    model forever, no matter how many times it's retrained -- silently
+    defeating the point of daily retraining, with no error to notice it by.
+    This looks up the actual latest version instead.
+    """
+    models = mr.get_models(model_name)
+    if not models:
+        raise ValueError(f"No registered versions found for model '{model_name}'")
+    latest = max(models, key=lambda m: m.version)
+    return latest.version
+
+
 def load_models_from_registry(mr):
     models = {}
     try:
         for idx in HORIZONS:
             model_name = MODEL_NAME_TEMPLATE.format(horizon=idx)
-            logger.info(f"Fetching registered model '{model_name}'...")
-            model_meta = mr.get_model(model_name, version=1)
+            latest_version = get_latest_model_version(mr, model_name)
+            logger.info(f"Fetching registered model '{model_name}' v{latest_version}...")
+            model_meta = mr.get_model(model_name, version=latest_version)
             model_dir = model_meta.download()
 
             model_path = os.path.join(model_dir, "model.pkl")

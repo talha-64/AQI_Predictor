@@ -41,36 +41,37 @@ logger = logging.getLogger(__name__)
 
 
 def sanitize_dataframe_for_hopsworks(df: pd.DataFrame) -> pd.DataFrame:
-    """Sanitizes DataFrame to prevent Spark materialization and schema crashes in Hopsworks."""
+    """Sanitizes DataFrame to strictly conform to Apache Spark / Hudi schema rules."""
     df = df.copy()
 
-    df = df.sort_values("timestamp_unix").reset_index(drop=True)
+    # 1. Clean & standardize column names (lowercase, no spaces, no special characters)
+    df.columns = [c.lower().replace("-", "_").replace(" ", "_").replace(".", "_") for c in df.columns]
+
+    # 2. Convert event time strictly to naive UTC timestamp (Spark TimestampType)
     df["datetime_utc"] = pd.to_datetime(df["datetime_utc"]).dt.tz_localize(None)
 
-    # Was: [c for c in df.columns if c.startswith("epa_aqi_lead_")]
-    # Now uses the notebook's rolling-average target columns.
-    target_cols = [c for c in TARGET_COLS if c in df.columns]
-
-    # Drop rows where targets are legitimately missing (end of series) BEFORE any fill
+    # 3. Target columns cleanup
+    target_cols = [c.lower() for c in TARGET_COLS if c.lower() in df.columns]
     df = df.dropna(subset=target_cols).reset_index(drop=True)
 
-    # Only fill feature columns, never targets
+    # 4. Fill missing values in feature columns
     feature_cols = [c for c in df.columns if c not in target_cols]
     df[feature_cols] = df[feature_cols].bfill().ffill()
 
-    numeric_cols = df.select_dtypes(include=[np.number]).columns
-    fill_numeric = [c for c in numeric_cols if c not in target_cols]
-    df[fill_numeric] = df[fill_numeric].fillna(0.0)
-
+    # 5. Drop any row missing primary key or event time
     df = df.dropna(subset=["timestamp_unix", "datetime_utc"]).reset_index(drop=True)
+
+    # 6. Enforce strict type conversions (int64 for keys, float32 for metrics)
     df["timestamp_unix"] = df["timestamp_unix"].astype("int64")
 
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
     for col in numeric_cols:
         if col != "timestamp_unix":
-            df[col] = df[col].astype("float64")
+            df[col] = df[col].astype("float32")
 
-    if "primary_pollutant" in df.columns:
-        df["primary_pollutant"] = df["primary_pollutant"].astype(str)
+    # Replace any infinite values generated during rolling calculations
+    df = df.replace([np.inf, -np.inf], np.nan)
+    df = df.fillna(0.0)
 
     return df
 
@@ -86,7 +87,7 @@ def main(backfill_days: int):
 
     logger.info(f"Target Window: {start_utc.isoformat()} -> {now_utc.isoformat()} ({backfill_days} days)")
 
-    # 1. Fetch historical pollution
+    # 1. Fetch pollution
     raw_payload = fetch_historical_air_pollution_batch(
         start_unix=start_unix,
         end_unix=end_unix,
@@ -95,13 +96,12 @@ def main(backfill_days: int):
         chunk_days=30,
     )
 
-    record_count = len(raw_payload.get("list", []))
-    if record_count == 0:
+    if len(raw_payload.get("list", [])) == 0:
         logger.error("No pollution records retrieved. Aborting backfill pipeline.")
         sys.exit(1)
 
-    # 2. Fetch historical weather (Open-Meteo ERA5 reanalysis, no API key needed)
-    logger.info("Fetching historical weather data for the same window (Open-Meteo)...")
+    # 2. Fetch weather
+    logger.info("Fetching historical weather data from Open-Meteo...")
     weather_records = fetch_historical_weather_openmeteo(
         start_unix=start_unix,
         end_unix=end_unix,
@@ -109,42 +109,34 @@ def main(backfill_days: int):
         lon=LONGITUDE,
     )
 
-    if len(weather_records) == 0:
-        logger.warning(
-            "No weather records retrieved — proceeding with pollution-only features. "
-            "Model quality will suffer without meteorological features."
-        )
-
-    # 3. Build and engineer features (pollution + weather merged, reindexed to hourly,
-    #    notebook-aligned feature set + rolling-average targets)
+    # 3. Build features
     df_features = build_full_feature_pipeline(
         raw_payload,
         weather_records=weather_records,
         is_training=True,
     )
 
-    # 4. Sanitize for Spark ingestion
+    # 4. Sanitize DataFrame
     df_clean = sanitize_dataframe_for_hopsworks(df_features)
-    logger.info(
-        f"Sanitized DataFrame shape for insertion: {df_clean.shape} | Nulls remaining: {df_clean.isnull().sum().sum()}"
-    )
+    logger.info(f"Sanitized DataFrame shape for insertion: {df_clean.shape} | Nulls: {df_clean.isnull().sum().sum()}")
 
-    # 5. Authenticate with Hopsworks
+   # 5. Authenticate with Hopsworks
     project = hopsworks.login(
+        host="eu-west.cloud.hopsworks.ai",
         project=HOPSWORKS_PROJECT_NAME,
         api_key_value=HOPSWORKS_API_KEY,
     )
     feature_store = project.get_feature_store()
 
-    # 6. Re-get or create the Feature Group
+    # 6. Create or retrieve Feature Group
     aqi_fg = feature_store.get_or_create_feature_group(
         name=FEATURE_GROUP_NAME,
         version=FEATURE_GROUP_VERSION,
         primary_key=["timestamp_unix"],
         event_time="datetime_utc",
-        description="Hourly raw pollutant readings, weather features, cyclical time features, EMA/lag/volatility statistics, and multi-horizon rolling-average target variables.",
+        description="Hourly raw pollutant readings, weather features, cyclical time features, and multi-horizon targets.",
         online_enabled=True,
-        time_travel_format="HUDI",
+        time_travel_format="HUDI",  # Mandatory for Hopsworks 5.0
     )
 
     logger.info("Inserting sanitized DataFrame into Hopsworks...")
@@ -153,14 +145,11 @@ def main(backfill_days: int):
         write_options={"wait_for_job": False},
     )
 
-    logger.info("=== Phase 3: Historical Data Backfill Triggered Successfully! ===")
+    logger.info("=== Phase 3: Historical Data Backfill Completed Successfully! ===")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    # Was hardcoded to 730 days (2 years). The notebook trained on ~5 years
-    # of history (since Nov 2020) to reach the reported R² numbers — default
-    # here matches that. Override with --days if you want a shorter backfill.
-    parser.add_argument("--days", type=int, default=1900, help="How many days of history to backfill (~5yr default)")
+    parser.add_argument("--days", type=int, default=1900, help="How many days of history to backfill")
     args = parser.parse_args()
     main(args.days)

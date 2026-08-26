@@ -49,6 +49,39 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def read_full_feature_history(fg) -> pd.DataFrame:
+    """
+    Reads the FULL feature group (all historical rows) for training.
+
+    Was: fg.read() (defaults to Arrow Flight, which has had a server-side
+    crash bug) falling back to read_options={"use_hive": True} -- but the
+    Hive/Spark path depends on the OFFLINE MATERIALIZATION JOB having
+    succeeded, and that job has been failing.
+
+    Now: tries the ONLINE store first instead. Since this feature group's
+    primary key is timestamp_unix (every hour is a distinct key, nothing
+    gets overwritten), the online/RonDB store holds the full row history
+    too, not just "latest value per key" -- so this can serve a full
+    training read without depending on the broken materialization job at
+    all. Falls back to Hive/Spark only if the online read itself fails.
+
+    Caveat: pulling ~40k+ rows through the online JDBC path is a lot more
+    than the few hundred rows this pattern was originally proven on in
+    04_batch_inference.py -- it may be slow (multiple minutes) or hit the
+    same MySQL lock-wait timeout under load. It's the best available path
+    right now, not a guaranteed-fast one.
+    """
+    try:
+        logger.info("Attempting online feature group read (full history)...")
+        df = fg.read(online=True)
+        logger.info(f"Online read succeeded: {len(df)} rows.")
+        return df
+    except Exception as e:
+        logger.warning(f"Online read failed ({e}). Falling back to Hive/Spark backend...")
+        df = fg.read(read_options={"use_hive": True})
+        return df
+
+
 def main():
     logger.info("=== Starting Phase 4: Chained Multi-Horizon Training Pipeline ===")
 
@@ -65,8 +98,8 @@ def main():
 
     # Feature view now carries all three horizon targets as labels (was a
     # single 24h-lead target). Kept as a Hopsworks registry artifact for
-    # versioning/lineage — actual training data still comes from fg.read()
-    # directly below, same as your original pipeline did.
+    # versioning/lineage — actual training data still comes from
+    # read_full_feature_history below, same as your original pipeline did.
     try:
         fv = feature_store.get_feature_view(name=FEATURE_VIEW_NAME, version=FEATURE_VIEW_VERSION)
     except Exception:
@@ -80,11 +113,7 @@ def main():
         )
 
     logger.info("Reading feature matrix from Hopsworks Feature Group...")
-    try:
-        df = fg.read()
-    except Exception as e:
-        logger.warning(f"Arrow Flight stream failed ({e}). Falling back to Hive engine...")
-        df = fg.read(read_options={"use_hive": True})
+    df = read_full_feature_history(fg)
 
     df = df.sort_values("timestamp_unix").reset_index(drop=True)
     logger.info(f"Rows read from Feature Group: {len(df)}")
@@ -145,7 +174,6 @@ def main():
     # Local safety-net save (models/final_feature_list.pkl/feats_per_horizon.pkl)
     save_models_local(models, final_features, feats_per_horizon, out_dir="models")
 
-    # Register each horizon's model in the Hopsworks Model Registry
     # Register each horizon's model in the Hopsworks Model Registry
     for idx in HORIZONS:
         label = list(TARGET_MAPPING.keys())[idx - 1]
