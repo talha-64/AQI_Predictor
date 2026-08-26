@@ -35,9 +35,9 @@ jobs:
           HOPSWORKS_PROJECT_NAME: ${{ secrets.HOPSWORKS_PROJECT_NAME }}
         run: python pipelines/04_batch_inference.py
 
-      - name: Commit & Push Latest Predictions JSON
+      - name: Commit & Push Latest Predictions + History
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add predictions/latest_predictions.json
-          git diff-index --quiet HEAD || (git commit -m "chore: auto-update latest_predictions.json [skip ci]" && git push)
+          git add predictions/latest_predictions.json predictions/recent_history.csv
+          git diff-index --quiet HEAD || (git commit -m "chore: auto-update predictions + history [skip ci]" && git push)
