@@ -29,6 +29,8 @@ from src.config import (
     MODEL_NAME_TEMPLATE,
     NON_FEATURE_COLS,
     HORIZONS,
+    PREDICTIONS_PATH,
+    RECENT_HISTORY_PATH,
 )
 from src.feature_engineering import get_final_feature_list
 from src.model_trainer import feats_used_per_horizon, predict_next_3_days, load_models_local
@@ -52,7 +54,20 @@ AQI_CATEGORIES = [
     ("Hazardous", 301, 500),
 ]
 HAZARD_ALERT_THRESHOLD = 200
-HISTORY_HOURS_NEEDED = 250
+
+# Was HISTORY_HOURS_NEEDED = 250. Prediction only needs the latest row --
+# its EMA/lag columns were already computed once by 02_feature_pipeline.py
+# and stored on that row. This small window is just a forward-fill safety
+# net in case the very latest row has a stray NaN in some column.
+PREDICTION_READ_HOURS = 24
+
+# Dashboard's "recent trend" chart wants 14 days of history. Rather than
+# re-querying this whole window from Hopsworks every hour, the chart data
+# is maintained as a rolling window on disk (see update_recent_history_snapshot):
+# each hourly run appends just the one new row and drops whatever's fallen
+# outside the window. Hopsworks only gets queried for the full window once,
+# the very first time this pipeline runs (when the file doesn't exist yet).
+CHART_HISTORY_HOURS = 24 * 14
 
 
 def aqi_category(value: float) -> str:
@@ -62,7 +77,21 @@ def aqi_category(value: float) -> str:
     return "Hazardous"
 
 
-def fetch_latest_features(fg) -> pd.DataFrame:
+def fetch_recent_features(fg, read_hours: int) -> pd.DataFrame:
+    """
+    Reads the last `read_hours` rows from the Feature Group. Tries the
+    ONLINE store first (goes through Hopsworks' REST API to RonDB, not the
+    offline Arrow Flight/DuckDB service) -- proven to work, just somewhat
+    slow (~2-3 min regardless of window size, since the slowness is
+    server-side, not proportional to rows). Falls back to the Hive/Spark
+    backend, a genuinely different code path from Arrow Flight (per
+    Hopsworks docs: read_options={"use_hive": True}).
+
+    Deliberately does NOT attempt fg.read() (default) or any
+    "use_duckdb"/arrow-flight-disable combination -- those all route through
+    the offline Arrow Flight/DuckDB query service, which has a known
+    server-side crash ("release unlocked lock") as of Aug 2026.
+    """
     try:
         logger.info("Attempting online feature group read...")
         df_features = fg.read(online=True)
@@ -75,11 +104,78 @@ def fetch_latest_features(fg) -> pd.DataFrame:
 
     if "timestamp_unix" in df_features.columns:
         df_features["timestamp_unix"] = pd.to_numeric(df_features["timestamp_unix"])
-        df_features = df_features.sort_values("timestamp_unix").tail(HISTORY_HOURS_NEEDED).reset_index(drop=True)
+        df_features = df_features.sort_values("timestamp_unix").tail(read_hours).reset_index(drop=True)
     else:
-        df_features = df_features.tail(HISTORY_HOURS_NEEDED).reset_index(drop=True)
+        df_features = df_features.tail(read_hours).reset_index(drop=True)
 
     return df_features
+
+
+def update_recent_history_snapshot(fg, latest_row: pd.DataFrame):
+    """
+    Maintains predictions/recent_history.csv as a rolling 14-day window,
+    updated incrementally:
+
+      - First run ever (no file yet): does ONE larger Hopsworks query
+        (CHART_HISTORY_HOURS rows) to seed the full window.
+      - Every run after that: appends just the single latest row already
+        fetched for prediction -- no extra Hopsworks query at all -- then
+        drops whatever has aged out past the 14-day cutoff.
+
+    This keeps steady-state Hopsworks load to one small query per hour
+    (from fetch_recent_features for prediction) instead of a 336-row query
+    every run just for the dashboard chart.
+    """
+    # NOTE: datetime_utc can come back tz-naive or tz-aware depending on which
+    # Hopsworks backend served the read (online/RonDB vs. Hive/Spark fallback --
+    # see fetch_recent_features). Since this function may combine rows pulled
+    # from *different* backends in a single run (e.g. online succeeds for the
+    # prediction row but falls back to Hive for the backfill), every
+    # datetime_utc column is forced to the same tz representation (UTC-aware)
+    # immediately after parsing. Do not remove this normalization even if a
+    # single read path seems to "always" return one form -- the fallback in
+    # fetch_recent_features means the backend (and therefore tz-awareness)
+    # can differ read-to-read within the same run.
+    def _to_utc(series):
+        s = pd.to_datetime(series)
+        if s.dt.tz is None:
+            return s.dt.tz_localize("UTC")
+        return s.dt.tz_convert("UTC")
+
+    new_row = latest_row[["datetime_utc", "epa_aqi"]].copy()
+    new_row["datetime_utc"] = _to_utc(new_row["datetime_utc"])
+
+    if os.path.exists(RECENT_HISTORY_PATH):
+        hist = pd.read_csv(RECENT_HISTORY_PATH)
+        hist["datetime_utc"] = _to_utc(hist["datetime_utc"])
+        combined = pd.concat([hist, new_row], ignore_index=True)
+        # Dedupe in case this hour's row already exists (e.g. pipeline re-run) --
+        # keep the newer version.
+        combined = combined.drop_duplicates(subset="datetime_utc", keep="last")
+    else:
+        logger.info(
+            f"No existing history snapshot found -- doing a one-time "
+            f"{CHART_HISTORY_HOURS}-row backfill query from Hopsworks..."
+        )
+        backfill = fetch_recent_features(fg, read_hours=CHART_HISTORY_HOURS + 10)
+        combined = backfill[["datetime_utc", "epa_aqi"]].copy()
+        combined["datetime_utc"] = _to_utc(combined["datetime_utc"])
+        combined = pd.concat([combined, new_row], ignore_index=True)
+        combined = combined.drop_duplicates(subset="datetime_utc", keep="last")
+
+    combined = combined.sort_values("datetime_utc")
+
+    # Rolling window by TIME, not row count -- stays correct even if a run
+    # is occasionally missed (the window just has a gap, not a crash).
+    cutoff = combined["datetime_utc"].max() - pd.Timedelta(hours=CHART_HISTORY_HOURS)
+    combined = combined[combined["datetime_utc"] > cutoff]
+
+    os.makedirs(os.path.dirname(RECENT_HISTORY_PATH), exist_ok=True)
+    combined.to_csv(RECENT_HISTORY_PATH, index=False)
+    logger.info(
+        f"History snapshot now has {len(combined)} rows "
+        f"({combined['datetime_utc'].min()} -> {combined['datetime_utc'].max()})"
+    )
 
 
 def load_models_from_registry(mr):
@@ -117,9 +213,11 @@ def main():
 
     models = load_models_from_registry(mr)
 
+    # Small window only -- see PREDICTION_READ_HOURS comment above for why
+    # this doesn't need the full history anymore.
     logger.info(f"Fetching recent feature records from '{FEATURE_GROUP_NAME}_v{FEATURE_GROUP_VERSION}'...")
     fg = feature_store.get_feature_group(name=FEATURE_GROUP_NAME, version=FEATURE_GROUP_VERSION)
-    df_features = fetch_latest_features(fg)
+    df_features = fetch_recent_features(fg, read_hours=PREDICTION_READ_HOURS)
 
     fill_cols = [c for c in df_features.columns if c not in NON_FEATURE_COLS]
     df_features[fill_cols] = df_features[fill_cols].ffill()
@@ -128,6 +226,11 @@ def main():
     latest_ts = str(latest_row["datetime_utc"].iloc[0])
     current_aqi = float(latest_row["epa_aqi"].iloc[0])
     logger.info(f"Latest observation timestamp: {latest_ts} | Current EPA AQI: {current_aqi}")
+
+    # Update the dashboard's rolling 14-day history snapshot. Only queries
+    # Hopsworks again if this is the very first run ever (no file yet) --
+    # otherwise this is a pure local file operation, zero extra requests.
+    update_recent_history_snapshot(fg, latest_row)
 
     all_feature_cols = [
         c for c in df_features.columns
@@ -158,7 +261,7 @@ def main():
         "day3_hazardous": bool(predictions[3] >= HAZARD_ALERT_THRESHOLD),
     }
 
-    # 5A. Insert predictions into Hopsworks Feature Group
+    # Insert predictions into Hopsworks Feature Group
     pred_df = pd.DataFrame([pred_data])
     logger.info(f"Writing prediction record to Hopsworks feature group '{PREDICTIONS_FG_NAME}'...")
     pred_fg = feature_store.get_or_create_feature_group(
@@ -194,14 +297,11 @@ def main():
         },
     }
 
-    output_dir = ROOT_DIR / "predictions"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    json_path = output_dir / "latest_predictions.json"
-
-    with open(json_path, "w") as f:
+    PREDICTIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(PREDICTIONS_PATH, "w") as f:
         json.dump(json_payload, f, indent=2)
 
-    logger.info(f"Successfully saved snapshot to {json_path}")
+    logger.info(f"Successfully saved snapshot to {PREDICTIONS_PATH}")
 
     logger.info("\n" + "=" * 50)
     logger.info("           3-DAY AIR QUALITY FORECAST              ")

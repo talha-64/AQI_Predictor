@@ -8,17 +8,23 @@ import json
 import logging
 from pathlib import Path
 
-# Force-disable unstable Arrow Flight gRPC before Hopsworks imports
-os.environ["HOPSWORKS_NO_ARROW_FLIGHT"] = "true"
-
 # Add project root to sys.path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import pandas as pd
 import streamlit as st
-import hopsworks
 
-from src import config, model_trainer
+from src import config
+# NOTE: the dashboard no longer imports `hopsworks` or talks to it at all --
+# both predictions and history now come from local files written hourly by
+# pipelines/04_batch_inference.py (see load_predictions/load_recent_history
+# below). This also removes the HOPSWORKS_NO_ARROW_FLIGHT env var that was
+# here before -- it wasn't a real recognized setting in the hsfs client, so
+# it wasn't doing anything anyway. If you re-add any live Hopsworks read
+# here later, reuse the online-first / use_hive-fallback pattern from
+# pipelines/04_batch_inference.py's fetch_recent_features -- don't
+# reintroduce plain fg.read() or the "use_duckdb"/disable_flight combo,
+# both route through the Arrow Flight service that's been unreliable.
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("dashboard")
@@ -35,38 +41,10 @@ CATEGORY_COLORS = {
 }
 
 
-@st.cache_resource(ttl=3600)
-def get_hopsworks_project():
-    return hopsworks.login(
-        project=config.HOPSWORKS_PROJECT_NAME,
-        api_key_value=config.HOPSWORKS_API_KEY,
-    )
-
-
-def read_feature_group_fast(fg):
-    """Fast offline feature reader using DuckDB over REST.
-    
-    Avoids Hive/Spark fallbacks which cause multi-minute hangs in cloud apps.
-    """
-    try:
-        # 1. Primary: Try direct online store query (sub-second)
-        return fg.read(online=True)
-    except Exception as e:
-        logger.warning(f"Online read failed ({e}). Falling back to DuckDB REST engine...")
-        # 2. Fallback: Fast DuckDB engine over HTTP REST instead of slow Hive/Spark
-        return fg.select_all().read(
-            dataframe_type="pandas",
-            read_options={
-                "use_duckdb": True,
-                "arrow_flight_config": {"disable_flight": True},
-            },
-        )
-
-
 @st.cache_data(ttl=60, show_spinner="Loading latest predictions...")
 def load_predictions():
-    json_path = os.path.join(os.path.dirname(__file__), "..", "predictions", "latest_predictions.json")
-    
+    json_path = config.PREDICTIONS_PATH
+
     if os.path.exists(json_path):
         try:
             with open(json_path, "r") as f:
@@ -79,22 +57,35 @@ def load_predictions():
 
 
 @st.cache_data(ttl=1800, show_spinner="Loading historical trend...")
-def load_recent_history(hours: int = 24 * 14):
-    try:
-        project = get_hopsworks_project()
-        fs = project.get_feature_store()
-        fg = fs.get_feature_group(config.FEATURE_GROUP_NAME, version=config.FEATURE_GROUP_VERSION)
-        
-        # Read with DuckDB over REST
-        df = read_feature_group_fast(fg)
-        
-        if "datetime_utc" in df.columns:
-            df["datetime_utc"] = pd.to_datetime(df["datetime_utc"])
-            df = df.sort_values("datetime_utc")
-            return df.tail(hours)[["datetime_utc", "epa_aqi"]]
+def load_recent_history():
+    """
+    Reads the small local CSV (datetime_utc, epa_aqi) maintained by
+    pipelines/04_batch_inference.py's update_recent_history_snapshot(),
+    instead of querying Hopsworks live.
+
+    This used to query the full aqi_hourly_fg feature group (60+ columns)
+    directly from the dashboard on every page load. Locally that was slow
+    (MySQL lock timeouts, then Arrow Flight retries/timeouts); on Streamlit
+    Cloud it hung indefinitely, since Arrow Flight's gRPC connection
+    commonly gets silently blocked by restricted outbound networks rather
+    than cleanly rejected -- so it just spins forever instead of erroring.
+    Reading a file that's already in the repo sidesteps both problems, and
+    the file itself is maintained incrementally (one row appended per hour,
+    not re-queried), so Hopsworks only gets touched by the pipeline, never
+    by the dashboard -- worth keeping in mind on the free tier.
+    """
+    csv_path = config.RECENT_HISTORY_PATH
+
+    if not os.path.exists(csv_path):
+        logger.warning(f"'{csv_path}' not found -- has pipelines/04_batch_inference.py run yet?")
         return pd.DataFrame()
+
+    try:
+        df = pd.read_csv(csv_path)
+        df["datetime_utc"] = pd.to_datetime(df["datetime_utc"])
+        return df.sort_values("datetime_utc")
     except Exception as e:
-        logger.error(f"Error fetching history: {e}")
+        logger.error(f"Error reading local history CSV: {e}")
         return pd.DataFrame()
 
 
@@ -130,8 +121,8 @@ def main():
 
     cols = st.columns(4)
     render_forecast_card(cols[0], "Current", {
-        "aqi": predictions["current_aqi"], 
-        "category": predictions["current_category"], 
+        "aqi": predictions["current_aqi"],
+        "category": predictions["current_category"],
         "hazardous_alert": False
     })
     for h, col in zip(config.HORIZONS, cols[1:]):

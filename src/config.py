@@ -6,6 +6,7 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).resolve().parent.parent
 PREDICTIONS_DIR = ROOT_DIR / "predictions"
 PREDICTIONS_PATH = PREDICTIONS_DIR / "latest_predictions.json"
+RECENT_HISTORY_PATH = PREDICTIONS_DIR / "recent_history.csv"
 
 # Ensure directory exists
 PREDICTIONS_DIR.mkdir(parents=True, exist_ok=True)
@@ -103,4 +104,3 @@ LGBM_PARAMS = dict(
 BLEND_WEIGHT = 0.4  # final_pred = BLEND_WEIGHT * model_pred + (1 - BLEND_WEIGHT) * current_aqi
 
 MODEL_NAME_TEMPLATE = "aqi_lgbm_day{horizon}"
-
