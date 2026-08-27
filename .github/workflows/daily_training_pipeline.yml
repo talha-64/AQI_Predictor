@@ -2,7 +2,7 @@ name: Daily Training Pipeline
 
 on:
   schedule:
-    - cron: "30 2 * * *" # 02:30 UTC daily — after several hourly feature runs have landed
+    - cron: "30 2 * * *" # 02:30 UTC daily - after several hourly feature runs have landed
   workflow_dispatch: {}
 
 jobs:

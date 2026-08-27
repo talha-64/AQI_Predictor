@@ -2,7 +2,7 @@ name: Hourly Feature & Inference Pipeline
 
 on:
   schedule:
-    - cron: "17 * * * *" # 5 minutes past every hour, UTC
+    - cron: "17 * * * *" # 17 minutes past every hour, UTC
   workflow_dispatch: {} # allows manual trigger from the Actions tab
 
 jobs:
