@@ -179,41 +179,43 @@ def main():
 
     st.divider()
 
-    # --- Interactive Deep Dive Tabs ---
-    tab1, tab2, tab3 = st.tabs(["📊 Historical Trend", "🎯 Horizon Analysis", "🧠 Model Explainability"])
+    # --- Standalone Historical Trend Section ---
+    st.subheader("Recent AQI Trend (Last 14 Days)")
+    history = load_recent_history()
+    
+    if not history.empty:
+        history['datetime_pkt'] = history['datetime_utc'].dt.tz_localize('UTC').dt.tz_convert('Asia/Karachi')
+        
+        fig = px.line(
+            history, 
+            x="datetime_pkt", 
+            y="epa_aqi", 
+            labels={"datetime_pkt": "Time (PKT)", "epa_aqi": "US EPA AQI"},
+            template="plotly_dark"
+        )
+        
+        fig.update_traces(line_color="#00b4d8", line_width=2)
+        
+        fig.add_hline(y=100, line_dash="dot", line_color="#ff7e00", annotation_text="Unhealthy for Sensitive Groups (100)", annotation_position="top left")
+        fig.add_hline(y=150, line_dash="dot", line_color="#ff0000", annotation_text="Unhealthy (150)", annotation_position="top left")
+        
+        fig.update_layout(
+            height=380,
+            margin=dict(l=20, r=20, t=30, b=20),
+            xaxis_title="Date & Time (PKT)",
+            yaxis_title="US EPA AQI Level"
+        )
+        
+        st.plotly_chart(fig, width="stretch")
+    else:
+        st.info("History currently unavailable.")
+
+    st.divider()
+
+    # --- Switchable Tabs Section (Horizon Analysis & Model Explainability) ---
+    tab1, tab2 = st.tabs(["🎯 Horizon Analysis", "🧠 Model Explainability"])
 
     with tab1:
-        st.subheader("Recent AQI Trend (Last 14 Days)")
-        history = load_recent_history()
-        
-        if not history.empty:
-            history['datetime_pkt'] = history['datetime_utc'].dt.tz_localize('UTC').dt.tz_convert('Asia/Karachi')
-            
-            fig = px.line(
-                history, 
-                x="datetime_pkt", 
-                y="epa_aqi", 
-                labels={"datetime_pkt": "Time (PKT)", "epa_aqi": "US EPA AQI"},
-                template="plotly_dark"
-            )
-            
-            fig.update_traces(line_color="#00b4d8", line_width=2)
-            
-            fig.add_hline(y=100, line_dash="dot", line_color="#ff7e00", annotation_text="Unhealthy for Sensitive Groups (100)", annotation_position="top left")
-            fig.add_hline(y=150, line_dash="dot", line_color="#ff0000", annotation_text="Unhealthy (150)", annotation_position="top left")
-            
-            fig.update_layout(
-                height=380,
-                margin=dict(l=20, r=20, t=30, b=20),
-                xaxis_title="Date & Time (PKT)",
-                yaxis_title="US EPA AQI Level"
-            )
-            
-            st.plotly_chart(fig, width="stretch")
-        else:
-            st.info("History currently unavailable.")
-
-    with tab2:
         st.subheader("Multi-Horizon Forecast Breakdown")
         h_col1, h_col2, h_col3 = st.columns(3)
         with h_col1:
@@ -229,7 +231,7 @@ def main():
             st.metric("Predicted AQI", f"{predictions['forecast']['day_3']['aqi']:.0f}")
             st.caption("Confidence Band: ± 15 AQI")
 
-    with tab3:
+    with tab2:
         st.subheader("Model Validation & Explainability")
         col_metric, col_chart = st.columns([1, 1])
 
