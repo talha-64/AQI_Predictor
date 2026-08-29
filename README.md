@@ -14,6 +14,7 @@ An end-to-end, 100% serverless machine learning system that forecasts the Air Qu
 
 **Data Science Internship Project** · [Muhammad Talha](https://github.com/talha-64) · [Repository](https://github.com/talha-64/AQI_Predictor)
 
+**Live Preview:** https://aqipredictor-10p.streamlit.app/
 ---
 
 ## Overview
