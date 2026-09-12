@@ -4,17 +4,17 @@
   "current_category": "Moderate",
   "forecast": {
     "day_1": {
-      "aqi": 94.7,
+      "aqi": 94.4,
       "category": "Moderate",
       "hazardous_alert": false
     },
     "day_2": {
-      "aqi": 106.4,
+      "aqi": 104.4,
       "category": "Unhealthy for Sensitive Groups",
       "hazardous_alert": false
     },
     "day_3": {
-      "aqi": 109.3,
+      "aqi": 109.5,
       "category": "Unhealthy for Sensitive Groups",
       "hazardous_alert": false
     }
