@@ -4,7 +4,7 @@
   "current_category": "Unhealthy",
   "forecast": {
     "day_1": {
-      "aqi": 150.8,
+      "aqi": 150.7,
       "category": "Hazardous",
       "hazardous_alert": false
     },
