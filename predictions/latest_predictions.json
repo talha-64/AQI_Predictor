@@ -4,12 +4,12 @@
   "current_category": "Unhealthy for Sensitive Groups",
   "forecast": {
     "day_1": {
-      "aqi": 120.8,
+      "aqi": 120.9,
       "category": "Unhealthy for Sensitive Groups",
       "hazardous_alert": false
     },
     "day_2": {
-      "aqi": 125.7,
+      "aqi": 125.6,
       "category": "Unhealthy for Sensitive Groups",
       "hazardous_alert": false
     },
