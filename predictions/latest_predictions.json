@@ -1,20 +1,20 @@
 {
-  "generated_at": "2026-09-18 10:18:21",
-  "current_aqi": 98.0,
-  "current_category": "Moderate",
+  "generated_at": "2026-09-18 11:18:29",
+  "current_aqi": 103.0,
+  "current_category": "Unhealthy for Sensitive Groups",
   "forecast": {
     "day_1": {
-      "aqi": 108.5,
-      "category": "Unhealthy for Sensitive Groups",
-      "hazardous_alert": false
-    },
-    "day_2": {
       "aqi": 111.5,
       "category": "Unhealthy for Sensitive Groups",
       "hazardous_alert": false
     },
+    "day_2": {
+      "aqi": 118.5,
+      "category": "Unhealthy for Sensitive Groups",
+      "hazardous_alert": false
+    },
     "day_3": {
-      "aqi": 116.4,
+      "aqi": 125.9,
       "category": "Unhealthy for Sensitive Groups",
       "hazardous_alert": false
     }
