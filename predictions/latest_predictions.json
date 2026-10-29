@@ -1,20 +1,20 @@
 {
-  "generated_at": "2026-10-29 01:18:25",
+  "generated_at": "2026-10-29 01:50:35",
   "current_aqi": 172.0,
   "current_category": "Unhealthy",
   "forecast": {
     "day_1": {
-      "aqi": 190.3,
+      "aqi": 187.9,
       "category": "Unhealthy",
       "hazardous_alert": false
     },
     "day_2": {
-      "aqi": 213.0,
+      "aqi": 217.4,
       "category": "Very Unhealthy",
       "hazardous_alert": true
     },
     "day_3": {
-      "aqi": 230.7,
+      "aqi": 229.9,
       "category": "Very Unhealthy",
       "hazardous_alert": true
     }
