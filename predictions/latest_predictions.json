@@ -4,17 +4,17 @@
   "current_category": "Very Unhealthy",
   "forecast": {
     "day_1": {
-      "aqi": 246.4,
+      "aqi": 246.0,
       "category": "Very Unhealthy",
       "hazardous_alert": true
     },
     "day_2": {
-      "aqi": 268.9,
+      "aqi": 269.3,
       "category": "Very Unhealthy",
       "hazardous_alert": true
     },
     "day_3": {
-      "aqi": 273.5,
+      "aqi": 272.8,
       "category": "Very Unhealthy",
       "hazardous_alert": true
     }
